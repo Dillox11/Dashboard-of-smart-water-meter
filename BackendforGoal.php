@@ -1,5 +1,4 @@
 <?php
-
 $host = 'localhost';
 $db = 'smart water meter'; 
 $user = 'root';
@@ -8,55 +7,94 @@ $charset = 'utf8mb4';
 
 $dsn = "mysql:host=$host;dbname=$db;charset=$charset";
 $options = [
-
     PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
     PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
     PDO::ATTR_EMULATE_PREPARES => false,
 ];
+$max_goals = 20;
+$delete_limit = 10;
+
 $message_type = 'info';
-$message_body = 'Please submit the form to set a new goal.';
+$message_body = 'Please Create the form to set a new goal.';
 $all_goals = [];
 $pdo = null; 
+$current_goal_count = 0;
 
 try {
-
     $pdo = new PDO($dsn, $user, $pass, $options);
+    $sql_count = "SELECT COUNT(id) AS goal_count FROM goals";
+    $stmt_count = $pdo->query($sql_count);
+    $goal_count_result = $stmt_count->fetch();
+    $current_goal_count = $goal_count_result ? (int)$goal_count_result['goal_count'] : 0;
+    if ($_SERVER["REQUEST_METHOD"] != "POST" && $current_goal_count >= $max_goals) {
+        $message_type = 'warning';
+        $message_body = "Goal setting is currently paused. You have **$current_goal_count** goals saved, which meets the maximum limit of $max_goals. The oldest goals will be cleaned up automatically.";
+    }
     if ($_SERVER["REQUEST_METHOD"] == "POST") {
 
-        $goal_name = filter_input(INPUT_POST, 'goal_name', FILTER_SANITIZE_SPECIAL_CHARS);
-        $target_amount = filter_input(INPUT_POST, 'target_amount', FILTER_VALIDATE_FLOAT);
-        $target_date = filter_input(INPUT_POST, 'target_date', FILTER_SANITIZE_STRING);
-        $goal_period = filter_input(INPUT_POST, 'goal_period', FILTER_SANITIZE_STRING); 
-        $valid_periods = ['Day', 'Week', 'Month'];
-        $is_period_valid = in_array($goal_period, $valid_periods);
-
-        if (!$goal_name || $target_amount === false || $target_amount <= 0 || !$target_date || !$is_period_valid) {
-            $message_type = 'error';
-            $message_body = 'Error: Please ensure all fields are filled correctly. Target amount must be a positive number and Goal Period must be selected.';
+        if ($current_goal_count >= $max_goals) {
+            $message_type = 'warning';
+            $message_body = "Warning: The maximum limit of $max_goals goals has been reached (Currently **$current_goal_count** saved goals). Your new goal was **not saved**. The system will now check for cleanup.";
         } else {
-            $sql = "INSERT INTO goals (goal_name, target_amount, goal_period, target_date) VALUES (?, ?, ?, ?)";
-            $stmt = $pdo->prepare($sql);
+            $goal_name = filter_input(INPUT_POST, 'goal_name', FILTER_SANITIZE_SPECIAL_CHARS);
+            $target_amount = filter_input(INPUT_POST, 'target_amount', FILTER_VALIDATE_FLOAT);
+            $target_date = filter_input(INPUT_POST, 'target_date', FILTER_SANITIZE_STRING);
+            $goal_period = filter_input(INPUT_POST, 'goal_period', FILTER_SANITIZE_STRING);
+            
+            $valid_periods = ['Day', 'Week', 'Month'];
+            $is_period_valid = in_array($goal_period, $valid_periods);
 
-            $stmt->execute([$goal_name, $target_amount, $goal_period, $target_date]);
+            if (!$goal_name || $target_amount === false || $target_amount <= 0 || !$target_date || !$is_period_valid) {
+                $message_type = 'error';
+                $message_body = 'Please ensure all fields are filled correctly. Target amount must be a positive number and Goal Period must be selected.';
+            } else {
+                $sql = "INSERT INTO goals (goal_name, target_amount, goal_period, target_date) VALUES (?, ?, ?, ?)";
+                $stmt = $pdo->prepare($sql);
+                $stmt->execute([$goal_name, $target_amount, $goal_period, $target_date]);
 
-            $message_type = 'success';
-            $message_body = "Success! Goal \"{$goal_name}\" has been saved. Target: **" . number_format($target_amount, 2) . "** per **{$goal_period}**, due **{$target_date}**.";
+                $message_type = 'success';
+                $message_body = "Success! Goal \"{$goal_name}\" has been saved. Target: **" . number_format($target_amount, 2) . "** per **{$goal_period}**, due **{$target_date}**.";
+                $stmt_count = $pdo->query($sql_count);
+                $goal_count_result = $stmt_count->fetch();
+                $current_goal_count = $goal_count_result ? (int)$goal_count_result['goal_count'] : 0;
+            }
+        }
+    }
+    
+    if ($current_goal_count >= $max_goals) {
+        
+        $sql_oldest_ids = "SELECT id FROM goals ORDER BY id ASC LIMIT $delete_limit";
+        $stmt_oldest_ids = $pdo->query($sql_oldest_ids);
+        $ids_to_delete = $stmt_oldest_ids->fetchAll(PDO::FETCH_COLUMN, 0); 
 
+        if (!empty($ids_to_delete)) {
+            $placeholders = str_repeat('?,', count($ids_to_delete) - 1) . '?';
+            $sql_delete = "DELETE FROM goals WHERE id IN ($placeholders)";
+            $stmt_delete = $pdo->prepare($sql_delete);
+            $stmt_delete->execute($ids_to_delete);
+
+            $cleanup_message = "Automated Cleanup Triggered: You had **$current_goal_count** goals (limit $max_goals). **" . count($ids_to_delete) . " oldest goal(s)** (IDs: " . implode(', ', $ids_to_delete) . ") have been deleted.";
+
+            if ($message_type === 'info' || $message_type === 'success') {
+                $message_type = 'info';
+                $message_body = $cleanup_message;
+            } else if ($message_type === 'warning') {
+                $message_body .= "\n\n$cleanup_message";
+            }
+            $stmt_count = $pdo->query($sql_count);
+            $goal_count_result = $stmt_count->fetch();
+            $current_goal_count = $goal_count_result ? (int)$goal_count_result['goal_count'] : 0;
         }
     }
 
-    $sql_fetch = "SELECT id, goal_name, target_amount, goal_period, target_date FROM goals ORDER BY target_date DESC, id DESC";
+    $sql_fetch = "SELECT id, goal_name, target_amount, goal_period, target_date FROM goals ORDER BY id DESC";
     $stmt_fetch = $pdo->query($sql_fetch);
     $all_goals = $stmt_fetch->fetchAll();
 
 
 } catch (\PDOException $e) {
     $message_type = 'error';
-    if ($message_type === 'info' || $_SERVER["REQUEST_METHOD"] !== "POST") {
-        $message_body = 'Database Connection/Fetch Error: Could not connect to the database or retrieve goals. Error: ' . $e->getMessage();
-    } else {
-        $message_body = 'Database Save Error: Could not save the goal. Error: ' . $e->getMessage();
-    }
+    $message_body = 'Database Error: Could not process the request. Error: ' . $e->getMessage();
 }
 
 ?>
@@ -65,12 +103,14 @@ try {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Goal Submission Result & Goal List</title>
+    <title>Goal Setter</title>
     <script src="https://cdn.tailwindcss.com"></script>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&display=swap" rel="stylesheet">
     <style>
-        body { font-family: 'Inter', sans-serif; background-color: #f7f9fc; }
-
+        body { 
+            font-family: 'Inter', sans-serif; 
+            min-height: 100vh;
+        }
         @keyframes goalFadeIn {
             from { opacity: 0; transform: translateY(15px); }
             to { opacity: 1; transform: translateY(0); }
@@ -80,40 +120,12 @@ try {
             animation: goalFadeIn 0.5s ease-out forwards;
             opacity: 0; 
         }
-
-        @media (max-width: 767px) {
-            .goal-card {
-                display: flex;
-                flex-direction: column;
-                border: 1px solid #e5e7eb;
-                border-radius: 0.75rem;
-                padding: 1rem;
-                margin-bottom: 1rem;
-                background-color: white;
-                box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -2px rgba(0, 0, 0, 0.06);
-                transition: transform 0.2s, box-shadow 0.2s; 
-            }
-            .goal-card:hover {
-                transform: translateY(-3px); 
-                box-shadow: 0 10px 20px rgba(79, 70, 229, 0.2); 
-            }
-            .goal-card div {
-                display: flex;
-                justify-content: space-between;
-                padding: 0.5rem 0;
-                border-bottom: 1px dashed #f3f4f6; 
-            }
-            .goal-card div:last-child { border-bottom: none; }
-            .goal-card .label { font-weight: 600; color: #4b5563; font-size: 0.875rem; }
-            .goal-card .value { font-weight: 700; color: #1f2937; text-align: right; font-size: 0.875rem; }
-        }
     </style>
 </head>
-<body class="min-h-screen flex flex-col items-center p-4 md:p-8">
-    <div class="w-full max-w-4xl"> 
-
-        <div class="bg-white p-8 md:p-10 rounded-xl shadow-2xl mb-8">
-            <h1 class="text-3xl font-bold text-gray-800 mb-6 text-center">Goal Submission Status</h1>
+<body class="bg-gray-900 text-gray-200 flex flex-col items-center p-4 md:p-8">
+    <div class="w-full max-w-5xl">
+        <div class="bg-gray-800 p-6 md:p-8 rounded-xl shadow-2xl mb-8 border border-gray-700">
+            <h1 class="text-3xl font-extrabold text-indigo-400 mb-6 text-center">Goal Submission Status</h1>
             
             <?php
             $bg_color = '';
@@ -128,73 +140,85 @@ try {
                 $bg_color = 'bg-red-100 border-red-600 text-red-800';
                 $icon = '❌';
                 $title = 'Submission Error';
+            } elseif ($message_type === 'warning') {
+                 $bg_color = 'bg-yellow-100 border-yellow-600 text-yellow-800';
+                 $icon = '⚠️';
+                 $title = 'Limit Reached!';
             } else { 
                 $bg_color = 'bg-blue-100 border-blue-600 text-blue-800';
-                $icon = 'ℹ️';
-                $title = 'Awaiting Submission';
+                $title = strpos($message_body, 'Cleanup Triggered') !== false ? 'History Cleaned' : 'Awaiting Submission';
+                $icon = strpos($message_body, 'Cleanup Triggered') !== false ? '🗑️' : 'ℹ️';
             }
             ?>
-
-            <div class="p-4 rounded-lg border-l-4 border-r-4 <?= $bg_color ?> transition duration-300 shadow-md" role="alert">
+                  <div class="mt-6 text-center">
+                      <a href="UI.php"
+                          class="inline-flex items-center px-1 py-6 border border-transparent text-base font-medium rounded-xl shadow-xl text-white bg-green-1000 hover:bg-green-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 transition duration-150 transform hover:scale-[1.03]">
+                       ↩ Back To Dashboard ↪       
+                      </a>
+                      <br>
+                  </div>
+            <div class="p-4 rounded-lg border-l-4 border-r-4 <?= $bg_color ?> transition duration-300 shadow-lg" role="alert">
                 <p class="font-bold text-lg mb-2"><?= $icon ?> <?= $title ?></p>
-                <p class="text-sm mt-1">
+                <p class="text-sm mt-1 whitespace-pre-line">
                     <?= nl2br(htmlspecialchars(str_replace(['**', '*'], ['<b>', '</b>'], $message_body))) ?>
+                </p>
+                <p class="text-xs mt-3 font-semibold">
+                    Current Goal Count: <span class="text-base"><?= $current_goal_count ?></span> / <?= $max_goals ?>
                 </p>
             </div>
 
-            <div class="mt-8 text-center">
+            <div class="mt-6 text-center">
                 <a href="Goal.html"
-                    class="inline-flex items-center px-6 py-3 border border-transparent text-base font-medium rounded-lg shadow-xl text-white bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 transition duration-150 transform hover:scale-[1.03]">
-                    &larr; Go Back to Set Another Goal
+                    class="inline-flex items-center px-6 py-3 border border-transparent text-base font-medium rounded-xl shadow-xl text-white bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 transition duration-150 transform hover:scale-[1.03]">
+                    Go to Goal Setting Form →
                 </a>
             </div>
         </div>
 
-        <div class="mt-12 bg-white p-8 md:p-10 rounded-xl shadow-2xl">
-            <h2 class="text-2xl font-bold text-white mb-6 text-center p-4 rounded-lg bg-gradient-to-r from-indigo-600 to-purple-600 shadow-lg">
-                Advanced: Goal History
+        <div class="mt-12 bg-gray-800 p-6 md:p-8 rounded-xl shadow-2xl border border-gray-700">
+            <h2 class="text-2xl font-extrabold text-white mb-8 text-center p-4 rounded-xl bg-gradient-to-r from-indigo-600 to-purple-700 shadow-xl">
+                A Setted Goal History
             </h2>
 
             <?php if (empty($all_goals)): ?>
-                <p class="text-center text-gray-500 p-4 bg-gray-50 rounded-lg">No goals have been saved yet.</p>
+                <p class="text-center text-gray-400 p-4 bg-gray-700 rounded-xl border border-gray-600">
+                    No goals have been saved yet. Set a goal to start tracking!
+                </p>
             <?php else: ?>
                 
-                <?php $delay_counter = 0; ?>
-
-                <div class="overflow-x-auto hidden md:block rounded-xl border border-gray-200 shadow-lg">
-                    <table class="min-w-full divide-y divide-indigo-200">
-                        <thead class="bg-indigo-50 border-b-2 border-indigo-200">
-                            <tr>
-                                <th class="px-6 py-3 text-left text-xs font-semibold text-indigo-700 uppercase tracking-wider w-1/4">Goal Name</th>
-                                <th class="px-6 py-3 text-left text-xs font-semibold text-indigo-700 uppercase tracking-wider">Target Amount (L)</th>
-                                <th class="px-6 py-3 text-left text-xs font-semibold text-indigo-700 uppercase tracking-wider">Period</th>
-                                <th class="px-6 py-3 text-left text-xs font-semibold text-indigo-700 uppercase tracking-wider">Target Date</th>
-                            </tr>
-                        </thead>
-                        <tbody class="bg-white divide-y divide-gray-100">
-                            <?php foreach ($all_goals as $goal): ?>
-                            <?php $delay_counter += 0.05; ?>
-                            <tr class="animate-goal-load hover:bg-purple-50 transition duration-200 cursor-pointer" 
-                                style="animation-delay: <?= $delay_counter ?>s; ">
-                                <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900"><?= htmlspecialchars($goal['goal_name']) ?></td>
-                                <td class="px-6 py-4 whitespace-nowrap text-sm text-indigo-600 font-bold"><?= number_format($goal['target_amount'], 2) ?></td>
-                                <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-600"><?= htmlspecialchars($goal['goal_period']) ?></td>
-                                <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-600"><?= htmlspecialchars($goal['target_date']) ?></td>
-                            </tr>
-                            <?php endforeach; ?>
-                        </tbody>
-                    </table>
-                </div>
-
-                <div class="md:hidden mt-4">
+                <div class="grid gap-6 sm:grid-cols-2 lg:grid-cols-3">
                     <?php $delay_counter = 0; ?>
                     <?php foreach ($all_goals as $goal): ?>
                     <?php $delay_counter += 0.1; ?>
-                    <div class="goal-card animate-goal-load" style="animation-delay: <?= $delay_counter ?>s;">
-                        <div><span class="label">Goal Name</span> <span class="value text-right font-semibold text-indigo-800"><?= htmlspecialchars($goal['goal_name']) ?></span></div>
-                        <div><span class="label">Target Amount</span> <span class="value text-purple-600"><?= number_format($goal['target_amount'], 2) ?> L</span></div>
-                        <div><span class="label">Period</span> <span class="value"><?= htmlspecialchars($goal['goal_period']) ?></span></div>
-                        <div><span class="label">Target Date</span> <span class="value"><?= htmlspecialchars($goal['target_date']) ?></span></div>
+                    <div class="bg-gray-700 border-t-8 border-indigo-500 rounded-xl p-6 shadow-xl hover:shadow-2xl transition duration-300 transform hover:scale-[1.02] animate-goal-load"
+                        style="animation-delay: <?= $delay_counter ?>s;">
+                        <h3 class="text-xl font-extrabold text-indigo-300 mb-4 border-b pb-2 border-indigo-300/50 truncate">
+                            <?= htmlspecialchars($goal['goal_name']) ?>
+                        </h3>
+                        <div class="space-y-4">
+                            <div class="flex justify-between items-center text-gray-200 p-2 bg-gray-800 rounded-lg border border-gray-600">
+                                <span class="font-semibold text-sm text-gray-400">Target Amount:</span>
+                                <span class="text-xl font-extrabold text-purple-400">
+                                    <?= number_format($goal['target_amount'], 2) ?> L
+                                </span>
+                            </div>
+                            <div class="flex justify-between items-center text-gray-200 p-2 bg-indigo-700/30 rounded-lg border border-indigo-600">
+                                <span class="font-bold text-sm text-indigo-200">Asetted Period:</span>
+                                <span class="text-lg font-extrabold text-indigo-300 bg-gray-800 px-3 py-1 rounded-full shadow-md">
+                                    <?= htmlspecialchars($goal['goal_period']) ?>
+                                </span>
+                            </div>
+                            <div class="flex justify-between items-center text-gray-200 p-2 bg-gray-800 rounded-lg border border-gray-600">
+                                <span class="font-semibold text-sm text-gray-400">Target Date:</span>
+                                <span class="text-md font-bold text-gray-300">
+                                    <?= htmlspecialchars($goal['target_date']) ?>
+                                </span>
+                            </div>
+                        </div>
+
+                        <div class="mt-5 text-xs text-right text-gray-500">
+                            No of Goal: <?= htmlspecialchars($goal['id']) ?>
+                        </div>
                     </div>
                     <?php endforeach; ?>
                 </div>
