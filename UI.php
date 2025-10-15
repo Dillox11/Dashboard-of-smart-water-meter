@@ -273,10 +273,10 @@ $totalCost = $totalVolumeLiters * $RATE_PER_LITER;
 $totalVolumeCubicMeters = $totalVolumeLiters / $LITERS_PER_CUBIC_METER;
 
 $displayRatePerM3 = number_format($RATE_PER_CUBIC_METER, 0);
-$displayTotalCost = $lastReading ? number_format($totalCost) : '--';
-$displayVolumeM3 = $lastReading ? number_format($totalVolumeCubicMeters) : '--';
+$displayTotalCost = $lastReading ? number_format($totalCost, 2) : '--';
+$displayVolumeM3 = $lastReading ? number_format($totalVolumeCubicMeters, 3) : '--';
 
-$displayVolume = $lastReading ? number_format($totalVolumeLiters) : '--';
+$displayVolume = $lastReading ? number_format($totalVolumeLiters, 3) : '--';
 $displayFlow = $lastReading ? number_format($lastReading['flow_rate'], 2) : '--';
 $displayTurbidity = $lastReading ? number_format($turbidityValue, 1) : '--';
 $displayTds = $lastReading ? intval($tdsValue) : '--';
