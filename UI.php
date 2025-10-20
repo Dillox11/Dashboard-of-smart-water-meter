@@ -1,4 +1,6 @@
 <?php
+// Smart Water Meter Dashboard Logic
+
 ini_set('display_errors', 1);
 ini_set('display_startup_errors', 1);
 error_reporting(E_ALL);
@@ -16,17 +18,38 @@ $goalFetchError = null;
 $USAGE_GOAL_MONTHLY = 0.0;
 $USAGE_GOAL_PERIOD = 'Monthly'; 
 $goalSourceMessage = "Goal is currently set to the default value of 0.0 L.";
+$currentCumulativeVolume = 0.0; 
+$displayCumulativeVolume = '--'; 
 
 if ($conn->connect_error) {
     $connError = "Connection failed: " . $conn->connect_error;
 } else {
-    // MODIFIED QUERY: Fetch the single latest (live) data row based on the highest ID.
+    // 1. Fetch the last sensor reading
     $sql = "SELECT id, timestamp, temperature, tds_value, turbidity_value, flow_rate, total_volume FROM users ORDER BY id DESC LIMIT 1";
     $result = $conn->query($sql);
 
     if ($result && $result->num_rows > 0) {
         $lastReading = $result->fetch_assoc();
     }
+    
+    // 2. Fetch the current cumulative volume from its dedicated log table
+    $sqlCumulative = "SELECT cumulative_volume FROM cumulative_volume_log WHERE id = 1 LIMIT 1";
+    $resultCumulative = $conn->query($sqlCumulative);
+    
+    if ($resultCumulative && $resultCumulative->num_rows > 0) {
+        $currentCumulativeVolume = floatval($resultCumulative->fetch_assoc()['cumulative_volume']); 
+        $displayCumulativeVolume = number_format($currentCumulativeVolume, 3);
+    } else {
+        // Fallback: use the last reading's total_volume as the initial cumulative volume if log is empty
+        if ($lastReading) {
+            // NOTE: This assumes the 'total_volume' in 'users' is the incremental volume,
+            // so this fallback is somewhat flawed but kept for consistency with original intent.
+            $currentCumulativeVolume = floatval($lastReading['total_volume']);
+            $displayCumulativeVolume = number_format($currentCumulativeVolume, 3);
+        }
+    }
+    
+    // 3. Fetch the usage goal
     $sqlGoal = "SELECT target_amount,goal_period FROM goals ORDER BY id DESC LIMIT 1";
     $resultGoal = $conn->query($sqlGoal);
 
@@ -45,23 +68,33 @@ if ($conn->connect_error) {
         $goalFetchError = "Could not retrieve a goal: " . $conn->error;
     }
 }
+
 $dateLabels = [];
 $dailyUsages = [];
 
+// --- FIX 2: Correcting Daily Usage Chart Data Calculation ---
 if (!$connError && $conn) {
     for ($i = 6; $i >= 0; $i--) {
         $date = date('Y-m-d', strtotime("-$i days"));
         $dateLabels[] = date('D, M d', strtotime("-$i days"));
         $startTime = $date . ' 00:00:00';
-        $endTime = ($i == 0) ? date('Y-m-d H:i:s') : $date . ' 23:59:59';
-        $sqlEndVolume = "SELECT total_volume FROM users WHERE timestamp <= '$endTime' ORDER BY timestamp DESC LIMIT 1";
-        $resultEndVolume = $conn->query($sqlEndVolume);
-        $endVolume = $resultEndVolume && $resultEndVolume->num_rows > 0 ? floatval($resultEndVolume->fetch_assoc()['total_volume']) : 0.0;
-        $sqlStartVolume = "SELECT total_volume FROM users WHERE timestamp < '$startTime' ORDER BY timestamp DESC LIMIT 1";
-        $resultStartVolume = $conn->query($sqlStartVolume);
-        $startVolume = $resultStartVolume && $resultStartVolume->num_rows > 0 ? floatval($resultStartVolume->fetch_assoc()['total_volume']) : 0.0;
+        // If it's today ($i=0), set end time to current time; otherwise, end of the day.
+        $endTime = ($i == 0) ? date('Y-m-d H:i:s') : $date . ' 23:59:59'; 
 
-        $dailyUsage = max(0.0, $endVolume - $startVolume);
+        // CORRECTED SQL: Calculate usage by summing up the total_volume (incremental flow) 
+        // recorded within the specific day's time boundaries.
+        $sqlDailyUsage = "SELECT SUM(total_volume) AS daily_usage FROM users 
+                          WHERE timestamp >= '$startTime' AND timestamp <= '$endTime'";
+                          
+        $resultDailyUsage = $conn->query($sqlDailyUsage);
+        $dailyUsage = 0.0;
+
+        if ($resultDailyUsage && $resultDailyUsage->num_rows > 0) {
+            $row = $resultDailyUsage->fetch_assoc();
+            // Use coalesce to handle null if no usage was recorded for the day
+            $dailyUsage = floatval($row['daily_usage'] ?? 0.0);
+        }
+        
         $dailyUsages[] = round($dailyUsage, 2);
     }
 }
@@ -71,10 +104,11 @@ $chartDataValuesJson = json_encode($dailyUsages);
 if ($_SERVER['REQUEST_METHOD'] == 'POST' && !$connError && $conn) {
     header('Content-Type: application/json');
     $data = json_decode(file_get_contents("php://input"), true);
+
     if (isset($data['command']) && ($data['command'] === 'ON' || $data['command'] === 'OFF')) {
         $command = $data['command'];
         $update_sql = "INSERT INTO device_state (id, valve_status) VALUES (1, ?)
-                       ON DUPLICATE KEY UPDATE valve_status = ?";
+                      ON DUPLICATE KEY UPDATE valve_status = ?";
         
         $stmt = $conn->prepare($update_sql);
         
@@ -100,32 +134,102 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && !$connError && $conn) {
              isset($data['tds_value']) && isset($data['turbidity_value']) &&
              isset($data['flow_rate']) && isset($data['total_volume'])) {
 
-        $temperature = $data['temperature'];
-        $tds_value = $data['tds_value'];
-        $turbidity_value = $data['turbidity_value'];
-        $flow_rate = $data['flow_rate'];
-        $total_volume = $data['total_volume'];
+        $temperature = (float)$data['temperature'];
+        $tds_value = (float)$data['tds_value'];
+        $turbidity_value = (float)$data['turbidity_value'];
+        $flow_rate = (float)$data['flow_rate'];
+        $total_volume = (float)$data['total_volume']; // This is the incremental volume, or Delta_V
         
-        $sql = "INSERT INTO users (temperature, tds_value, turbidity_value, flow_rate, total_volume)
-                 VALUES (?, ?, ?, ?, ?)";
+        $current_timestamp = date('Y-m-d H:i:s');
+        
+        $success = true;
+        $sensor_log_message = "Sensor data logged successfully.";
+
+        // Log the incremental reading to the 'users' table
+        $sql = "INSERT INTO users (timestamp, temperature, tds_value, turbidity_value, flow_rate, total_volume)
+                VALUES (?, ?, ?, ?, ?, ?)";
         
         $stmt = $conn->prepare($sql);
         
         if ($stmt) {
-            // FIX: Changed data types from "sssss" to "ddddd" (assuming all are decimals/doubles) 
-            // to ensure correct numeric insertion.
-            $stmt->bind_param("ddddd", $temperature, $tds_value, $turbidity_value, $flow_rate, $total_volume);
+            $stmt->bind_param("sddddd", $current_timestamp, $temperature, $tds_value, $turbidity_value, $flow_rate, $total_volume);
 
-            if ($stmt->execute()) {
-                echo json_encode(["status" => "success", "message" => "Sensor data logged successfully."]);
-            } else {
-                http_response_code(500);
-                echo json_encode(["status" => "error", "message" => "Database error logging sensor data: " . $stmt->error]);
+            if (!$stmt->execute()) {
+                $sensor_log_message = "Database error logging sensor data: " . $stmt->error;
+                $success = false;
             }
             $stmt->close();
         } else {
+            $sensor_log_message = "Failed to prepare SQL statement for sensor data: " . $conn->error;
+            $success = false;
+        }
+        $cumulative_volume_response = 0.0;
+        $cumulative_log_message = '';
+
+        if ($success) {
+            // Update the running total (cumulative volume log)
+            $cumulative_sql = "SELECT cumulative_volume FROM cumulative_volume_log WHERE id = 1 LIMIT 1";
+            $cumulative_result = $conn->query($cumulative_sql);
+            
+            $new_cumulative_volume = $total_volume; 
+            
+            if ($cumulative_result && $cumulative_result->num_rows > 0) {
+                $state_row = $cumulative_result->fetch_assoc();
+                $cumulative_volume = (float)$state_row['cumulative_volume'];
+                // Correctly add the incremental volume to the cumulative total
+                $new_cumulative_volume = $cumulative_volume + $total_volume;
+                
+                $update_sql = "UPDATE cumulative_volume_log SET 
+                                 cumulative_volume = ?
+                                 WHERE id = 1";
+                
+                $stmt_update = $conn->prepare($update_sql);
+                if ($stmt_update) {
+                    $stmt_update->bind_param("d", $new_cumulative_volume);
+                    if (!$stmt_update->execute()) {
+                        $cumulative_log_message = " | Cumulative update failed: " . $stmt_update->error;
+                        $success = false;
+                    }
+                    $stmt_update->close();
+                } else {
+                    $cumulative_log_message = " | Failed to prepare cumulative update: " . $conn->error;
+                    $success = false;
+                }
+
+            } else {
+                // Initialize the cumulative log if it doesn't exist
+                $insert_init_sql = "INSERT INTO cumulative_volume_log (id, cumulative_volume) 
+                                    VALUES (1, ?)";
+                $stmt_init = $conn->prepare($insert_init_sql);
+                if ($stmt_init) {
+                    $stmt_init->bind_param("d", $new_cumulative_volume);
+                    if (!$stmt_init->execute()) {
+                         $cumulative_log_message = ' (Cumulative log initialization failed: ' . $stmt_init->error . ')';
+                         $success = false;
+                    } else {
+                         $cumulative_log_message = ' (Cumulative log initialized)';
+                    }
+                    $stmt_init->close();
+                } else {
+                    $cumulative_log_message = " | Failed to prepare cumulative insert: " . $conn->error;
+                    $success = false;
+                }
+            }
+            
+            $cumulative_volume_response = round($new_cumulative_volume, 3);
+        }
+        if ($success) {
+            echo json_encode([
+                "status" => "success", 
+                "message" => $sensor_log_message . $cumulative_log_message,
+                "cumulative_volume" => $cumulative_volume_response
+            ]);
+        } else {
              http_response_code(500);
-             echo json_encode(["status" => "error", "message" => "Failed to prepare SQL statement for sensor data: " . $conn->error]);
+             echo json_encode([
+                 "status" => "error", 
+                 "message" => "Data processing failed: " . $sensor_log_message . $cumulative_log_message
+             ]);
         }
 
         $conn->close();
@@ -146,45 +250,54 @@ $initialValveText = $initialValveIsOn ? 'OPEN (ON)' : 'CLOSED (OFF)';
 $initialValveColor = $initialValveIsOn ? 'text-data-green' : 'text-data-red';
 $initialValveCardClass = $initialValveIsOn ? 'on border-data-green' : 'off border-data-red'; 
 
-$totalVolumeLiters = $lastReading ? floatval($lastReading['total_volume']) : 0.0;
 $tdsValue = $lastReading ? intval($lastReading['tds_value']) : 0;
 $turbidityValue = $lastReading ? floatval($lastReading['turbidity_value']) : 0.0;
 
-function getUsage($conn, $interval, $currentVolume) {
-    if ($currentVolume <= 0 || !$conn) return 0.0;
-    
-    // SECURITY FIX: Restrict $interval to known safe values to prevent SQL Injection
+// --- FIX 1: Correcting the getUsage Function ---
+/**
+ * Calculates water usage for a given time interval by summing up incremental 'total_volume' records.
+ * The $currentVolume parameter is now unused, as the calculation is done via SUM().
+ * @param mysqli $conn The database connection object.
+ * @param string $interval The interval to check ('1 DAY', '7 DAY', '30 DAY').
+ * @return float The total usage in Liters for the period.
+ */
+function getUsage($conn, $interval) {
+    if (!$conn) return 0.0;
     $safeIntervals = ['1 DAY', '7 DAY', '30 DAY'];
     if (!in_array($interval, $safeIntervals)) {
         error_log("Attempted SQL Injection via invalid interval: " . $interval);
         return 0.0; 
     }
 
-    $sql = "SELECT total_volume FROM users WHERE timestamp <= DATE_SUB(NOW(), INTERVAL $interval) ORDER BY timestamp DESC LIMIT 1";
+    // CORRECTED SQL: Sum all incremental total_volume entries since the start of the interval
+    $sql = "SELECT SUM(total_volume) AS total_usage_in_period 
+            FROM users 
+            WHERE timestamp >= DATE_SUB(NOW(), INTERVAL $interval)";
+            
     $result = $conn->query($sql);
 
-    if ($result && $result->num_rows > 0) {
-        $startVolume = floatval($result->fetch_assoc()['total_volume']);
-        $usage = $currentVolume - $startVolume;
+    if ($result) {
+        $row = $result->fetch_assoc();
+        // Use coalesce to handle null if no usage was recorded in the period
+        $usage = floatval($row['total_usage_in_period'] ?? 0.0);
         return max(0.0, $usage);
     }
-
-    return $currentVolume;
+    
+    // Return 0.0 if query fails
+    return 0.0;
 }
 
 $usageDay = 0.0;
 $usageWeek = 0.0;
 $usageMonth = 0.0;
 
-if (!$connError && $lastReading && $conn) {
-    $usageDay = getUsage($conn, '1 DAY', $totalVolumeLiters);
-    $usageWeek = getUsage($conn, '7 DAY', $totalVolumeLiters);
-    $usageMonth = getUsage($conn, '30 DAY', $totalVolumeLiters);
+// Calling the corrected getUsage function (removing the $currentCumulativeVolume parameter)
+if (!$connError && $conn) {
+    $usageDay = getUsage($conn, '1 DAY');
+    $usageWeek = getUsage($conn, '7 DAY');
+    $usageMonth = getUsage($conn, '30 DAY');
 }
 
-// --- START: CORRECTED GOAL CALCULATION LOGIC ---
-
-// 1. Determine the correct usage figure based on the goal period
 $currentGoalUsage = 0.0;
 switch (strtolower($USAGE_GOAL_PERIOD)) {
     case 'daily':
@@ -198,7 +311,6 @@ switch (strtolower($USAGE_GOAL_PERIOD)) {
     case 'monthly':
     case 'month':
     default:
-        // Use monthly as the fallback, matching the existing 30-day calculation
         $currentGoalUsage = $usageMonth;
         break;
 }
@@ -208,7 +320,6 @@ $goalStatusMessage = '';
 $goalStatusClass = '';
 
 if ($USAGE_GOAL_MONTHLY > 0) {
-    // Correct calculation: Remaining Liters = Goal Amount - Current Usage for the period
     $usageToGoal = $USAGE_GOAL_MONTHLY - $currentGoalUsage; 
 
     if ($usageToGoal > 1000) {
@@ -235,8 +346,6 @@ $displayUsageToGoal = number_format(abs($usageToGoal), 2);
 $isUnderGoal = $usageToGoal >= 0;
 $goalPeriod = $USAGE_GOAL_PERIOD; 
 $goalUnit = "Liters (L)";
-
-// Use $currentGoalUsage for charts/display data
 $used = round($currentGoalUsage, 2);
 $target = round($USAGE_GOAL_MONTHLY, 2);
 
@@ -263,20 +372,18 @@ if ($target > 0) {
     $goalPrimaryMetric = number_format($used, 0);
     $goalMetricLabel = "Used";
 }
-// --- END: CORRECTED GOAL CALCULATION LOGIC ---
 
 $RATE_PER_CUBIC_METER = 863.0; 
-$LITERS_PER_CUBIC_METER = 1000.0;
+$LITERS_PER_CUBIC_METER = 1000.0; 
 $RATE_PER_LITER = $RATE_PER_CUBIC_METER / $LITERS_PER_CUBIC_METER;
 
-$totalCost = $totalVolumeLiters * $RATE_PER_LITER;
-$totalVolumeCubicMeters = $totalVolumeLiters / $LITERS_PER_CUBIC_METER;
+$totalCost = $currentCumulativeVolume * $RATE_PER_LITER; 
+$totalVolumeCubicMeters = $currentCumulativeVolume / $LITERS_PER_CUBIC_METER; 
 
 $displayRatePerM3 = number_format($RATE_PER_CUBIC_METER, 0);
 $displayTotalCost = $lastReading ? number_format($totalCost, 2) : '--';
 $displayVolumeM3 = $lastReading ? number_format($totalVolumeCubicMeters, 3) : '--';
 
-$displayVolume = $lastReading ? number_format($totalVolumeLiters, 3) : '--';
 $displayFlow = $lastReading ? number_format($lastReading['flow_rate'], 2) : '--';
 $displayTurbidity = $lastReading ? number_format($turbidityValue, 1) : '--';
 $displayTds = $lastReading ? intval($tdsValue) : '--';
@@ -307,15 +414,17 @@ if ($lastReading) {
         $statusMessage = "🔸 **Note: Elevated TDS ({$displayTds} ppm).** Water is typically safe but monitor quality closely.";
         $statusClass = "bg-blue-900/30 border-water-blue text-blue-300";
     }
-    else if (floatval($displayFlow) == 0 && floatval($displayVolume) > 0) {
+    else if (floatval($displayFlow) == 0 && $currentCumulativeVolume > 0) {
         $statusMessage = "🔄 No flow detected, but total volume is high. Is the water supply currently off?";
         $statusClass = "bg-yellow-900/30 border-yellow-500 text-yellow-300";
     }
 }
-if (!$connError && $conn) {
+if ($_SERVER['REQUEST_METHOD'] != 'POST' && !$connError && $conn) {
     $conn->close();
 }
 ?>
+
+
 
 <!DOCTYPE html>
 <html lang="en">
@@ -559,7 +668,7 @@ if (!$connError && $conn) {
                 
                     <div class="metric-card bg-gray-800/50 border-l-4 border-water-blue text-center h-70 flex flex-col justify-center">
                        <p class="text-sm font-medium text-water-blue uppercase">Total Volume</p>
-                       <p class="text-4xl font-extrabold text-water-blue mt-1"><?= $displayVolume ?> <span class="text-lg text-gray-400">L</span></p>
+                       <p class="text-4xl font-extrabold text-water-blue mt-1"><?= $displayCumulativeVolume ?> <span class="text-lg text-gray-400">L</span></p>
                        <p class="text-xs text-gray-400 mt-1">Meter Reading</p>
                    </div>
 
@@ -767,7 +876,7 @@ if (!$connError && $conn) {
                             <div class="p-4 bg-gray-900/40 rounded-lg">
                                 <p class="text-sm font-medium text-gray-400 uppercase">Usage liters</p>
                                 <p class="text-3xl font-extrabold text-data-purple mt-1">
-                                    <?= $displayVolume ?> <span class="text-lg font-semibold text-gray-400">L</span>
+                                    <?= $displayCumulativeVolume ?> <span class="text-lg font-semibold text-gray-400">L</span>
                                 </p>
                             </div>
 
